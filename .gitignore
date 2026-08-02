@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# uv / virtual environments
+.venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Model files and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.ply
+*.npz
+
+# Datasets and outputs
+data/
+datasets/
+checkpoints/
+results/
+outputs/
+runs/
+
+# Temporary files
+*.tmp
+*.temp
