@@ -4,36 +4,32 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, TypeAlias
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor
 
-TensorTree: TypeAlias = dict[str, Any]
-MetadataValue: TypeAlias = Any
-Evaluator: TypeAlias = Callable[["Viewer4DGS", float], "GaussianFrame"]
 
-_FORMAT_MAGIC = "viewer4d.portable_model"
+_FORMAT_MAGIC = "anytimegs"
 _SCHEMA_VERSION = 1
-_EVALUATORS: dict[str, Evaluator] = {}
 
 
 @dataclass(frozen=True, slots=True)
 class SequenceInfo:
-    """Temporal information shared by every portable 4DGS model."""
+    """Sequence metadata for an AnytimeGS model.
+
+    AnytimeGS always uses a normalized evaluation time in [0, 1].
+    Frame 0 maps to t=0 and frame num_frames-1 maps to t=1.
+    """
 
     num_frames: int
     fps: float
-    time_min: float = 0.0
-    time_max: float = 1.0
 
     def __post_init__(self) -> None:
         if self.num_frames <= 0:
             raise ValueError("num_frames must be positive")
         if self.fps <= 0:
             raise ValueError("fps must be positive")
-        if self.time_max < self.time_min:
-            raise ValueError("time_max must be greater than or equal to time_min")
 
     def frame_to_time(self, frame: int) -> float:
         if not 0 <= frame < self.num_frames:
@@ -41,16 +37,19 @@ class SequenceInfo:
                 f"frame must be in [0, {self.num_frames - 1}], got {frame}"
             )
         if self.num_frames == 1:
-            return self.time_min
-        ratio = frame / (self.num_frames - 1)
-        return self.time_min + ratio * (self.time_max - self.time_min)
+            return 0.0
+        return frame / (self.num_frames - 1)
+
+    def time_to_frame(self, time: float) -> int:
+        _validate_eval_time(time)
+        if self.num_frames == 1:
+            return 0
+        return int(round(float(time) * (self.num_frames - 1)))
 
     def to_dict(self) -> dict[str, int | float]:
         return {
             "num_frames": self.num_frames,
             "fps": self.fps,
-            "time_min": self.time_min,
-            "time_max": self.time_max,
         }
 
     @classmethod
@@ -58,208 +57,274 @@ class SequenceInfo:
         return cls(
             num_frames=int(value["num_frames"]),
             fps=float(value["fps"]),
-            time_min=float(value.get("time_min", 0.0)),
-            time_max=float(value.get("time_max", 1.0)),
         )
 
 
 @dataclass(slots=True)
 class GaussianFrame:
-    """Render-ready static Gaussians evaluated at one time instant."""
+    """Render-ready static Gaussians at one normalized time."""
 
     means: Tensor
-    quats: Tensor
     scales: Tensor
+    quats: Tensor
     opacities: Tensor
-    sh_coeffs: Tensor
+    sh: Tensor
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    @property
+    def num_gaussians(self) -> int:
+        return int(self.means.shape[0])
+
+    @property
+    def device(self) -> torch.device:
+        return self.means.device
 
     def validate(self) -> None:
-        if self.means.ndim != 2 or self.means.shape[1] != 3:
-            raise ValueError(f"means must have shape [N, 3], got {self.means.shape}")
+        _require_shape("means", self.means, 2, last_dim=3)
         n = self.means.shape[0]
-        expected = {
-            "quats": (n, 4),
-            "scales": (n, 3),
-        }
-        for name, shape in expected.items():
-            tensor = getattr(self, name)
-            if tuple(tensor.shape) != shape:
-                raise ValueError(f"{name} must have shape {shape}, got {tensor.shape}")
+        _require_exact_shape("scales", self.scales, (n, 3))
+        _require_exact_shape("quats", self.quats, (n, 4))
 
-        if self.opacities.ndim == 2 and self.opacities.shape[1] == 1:
+        if self.opacities.ndim == 2 and self.opacities.shape == (n, 1):
             self.opacities = self.opacities[:, 0]
-        if tuple(self.opacities.shape) != (n,):
-            raise ValueError(
-                f"opacities must have shape [N] or [N, 1], got {self.opacities.shape}"
-            )
-        if self.sh_coeffs.ndim != 3 or self.sh_coeffs.shape[0] != n:
-            raise ValueError(
-                "sh_coeffs must have shape [N, K, 3], "
-                f"got {self.sh_coeffs.shape}"
-            )
-        if self.sh_coeffs.shape[2] != 3:
-            raise ValueError(
-                f"sh_coeffs last dimension must be 3, got {self.sh_coeffs.shape}"
-            )
+        _require_exact_shape("opacities", self.opacities, (n,))
 
-        devices = {
-            self.means.device,
-            self.quats.device,
-            self.scales.device,
-            self.opacities.device,
-            self.sh_coeffs.device,
-        }
-        if len(devices) != 1:
-            raise ValueError(f"all frame tensors must share one device, got {devices}")
+        if self.sh.ndim != 3 or self.sh.shape[0] != n or self.sh.shape[-1] != 3:
+            raise ValueError(f"sh must have shape [N, K, 3], got {tuple(self.sh.shape)}")
 
+        _require_same_device(
+            self.means,
+            self.scales,
+            self.quats,
+            self.opacities,
+            self.sh,
+        )
+        _require_floating(
+            means=self.means,
+            scales=self.scales,
+            quats=self.quats,
+            opacities=self.opacities,
+            sh=self.sh,
+        )
+        _require_finite(
+            means=self.means,
+            scales=self.scales,
+            quats=self.quats,
+            opacities=self.opacities,
+            sh=self.sh,
+        )
 
-class ModelImporter(Protocol):
-    """Interface implemented by source-format importers.
-
-    An importer may execute in another Python environment. Its final result must
-    be either a Viewer4DGS instance or a portable payload containing only tensors
-    and primitive metadata.
-    """
-
-    def convert(self, source: str | Path, **kwargs: Any) -> "Viewer4DGS | Mapping[str, Any]":
-        ...
+        if torch.any(self.scales <= 0):
+            raise ValueError("scales must be strictly positive")
+        if torch.any((self.opacities < 0) | (self.opacities > 1)):
+            raise ValueError("opacities must be in [0, 1]")
 
 
-def register_evaluator(name: str) -> Callable[[Evaluator], Evaluator]:
-    """Register the runtime evaluator for a portable representation."""
+class AnytimeGS:
+    """Fixed-schema portable 4D Gaussian representation.
 
-    if not name or not isinstance(name, str):
-        raise ValueError("representation name must be a non-empty string")
+    Stored parameters are source-independent, activated values:
 
-    def decorator(function: Evaluator) -> Evaluator:
-        if name in _EVALUATORS:
-            raise ValueError(f"evaluator already registered: {name}")
-        _EVALUATORS[name] = function
-        return function
+    - means:          [N, 3], Gaussian position at ``time_center``.
+    - scales:         [N, 3], positive Gaussian scales (not log-scales).
+    - quats:          [N, 4], rotation quaternions.
+    - opacities:      [N], base opacity in [0, 1] (not logits).
+    - sh:             [N, K, 3], spherical-harmonic coefficients.
+    - time_center:    [N], center time in normalized time coordinates.
+    - duration:       [N], positive temporal standard deviation in normalized
+                              time coordinates. It may be greater than 1.
+    - velocity:       [N, 3], displacement per one normalized time unit. Its
+                              magnitude is not bounded and may be greater than 1.
+    - temporal_gate:  [N], temporal-opacity floor in [0, 1]. A value close to
+                              1 makes a Gaussian effectively persistent.
 
-    return decorator
-
-
-class Viewer4DGS:
-    """Portable 4D Gaussian model used by 4Dviewer.
-
-    The class deliberately stores only:
-      * a representation identifier;
-      * sequence metadata;
-      * a nested tree of tensors;
-      * JSON-like metadata.
-
-    Source-project classes are never serialized. This lets converted files be
-    loaded in the viewer environment with ``torch.load(weights_only=True)``.
+    Evaluation time is always constrained to [0, 1]. ``time_center`` itself is
+    not clamped: source models may legitimately optimize centers outside the
+    observed interval, as long as they are expressed in the normalized time
+    coordinate system.
     """
 
     def __init__(
         self,
         *,
-        representation: str,
         sequence: SequenceInfo,
-        tensors: Mapping[str, Tensor | Mapping[str, Any]],
-        metadata: Mapping[str, MetadataValue] | None = None,
+        means: Tensor,
+        scales: Tensor,
+        quats: Tensor,
+        opacities: Tensor,
+        sh: Tensor,
+        time_center: Tensor,
+        duration: Tensor,
+        velocity: Tensor,
+        temporal_gate: Tensor | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        if not representation:
-            raise ValueError("representation must be a non-empty string")
-        self.representation = representation
         self.sequence = sequence
-        self.tensors = _copy_tensor_tree(tensors)
-        self.metadata: dict[str, MetadataValue] = _validate_metadata(metadata or {})
-        if not self.tensors:
-            raise ValueError("tensors must not be empty")
+        self.means = means
+        self.scales = scales
+        self.quats = quats
+        self.opacities = _flatten_scalar_parameter("opacities", opacities)
+        self.sh = sh
+        self.time_center = _flatten_scalar_parameter("time_center", time_center)
+        self.duration = _flatten_scalar_parameter("duration", duration)
+        self.velocity = velocity
+
+        if temporal_gate is None:
+            temporal_gate = torch.zeros_like(self.opacities)
+        self.temporal_gate = _flatten_scalar_parameter(
+            "temporal_gate", temporal_gate
+        )
+        self.metadata = _validate_metadata(dict(metadata or {}))
+
+        self.validate()
+
+    @property
+    def num_gaussians(self) -> int:
+        return int(self.means.shape[0])
 
     @property
     def device(self) -> torch.device:
-        first = next(_iter_tensors(self.tensors), None)
-        if first is None:
-            raise RuntimeError("model contains no tensors")
-        return first.device
+        return self.means.device
 
-    def tensor(self, path: str) -> Tensor:
-        """Read a tensor using a dotted path, e.g. ``base.means``."""
+    def validate(self) -> None:
+        _require_shape("means", self.means, 2, last_dim=3)
+        n = self.means.shape[0]
 
-        current: Any = self.tensors
-        for part in path.split("."):
-            if not isinstance(current, dict) or part not in current:
-                raise KeyError(f"tensor path not found: {path}")
-            current = current[part]
-        if not isinstance(current, Tensor):
-            raise KeyError(f"path points to a tensor group, not a tensor: {path}")
-        return current
+        _require_exact_shape("scales", self.scales, (n, 3))
+        _require_exact_shape("quats", self.quats, (n, 4))
+        _require_exact_shape("opacities", self.opacities, (n,))
+        _require_exact_shape("time_center", self.time_center, (n,))
+        _require_exact_shape("duration", self.duration, (n,))
+        _require_exact_shape("velocity", self.velocity, (n, 3))
+        _require_exact_shape("temporal_gate", self.temporal_gate, (n,))
 
-    def to(self, device: str | torch.device, *, non_blocking: bool = False) -> "Viewer4DGS":
-        """Move all stored tensors in place and return ``self``."""
+        if self.sh.ndim != 3 or self.sh.shape[0] != n or self.sh.shape[-1] != 3:
+            raise ValueError(f"sh must have shape [N, K, 3], got {tuple(self.sh.shape)}")
 
-        self.tensors = _map_tensor_tree(
-            self.tensors,
-            lambda value: value.to(device=device, non_blocking=non_blocking),
-        )
+        tensors = {
+            "means": self.means,
+            "scales": self.scales,
+            "quats": self.quats,
+            "opacities": self.opacities,
+            "sh": self.sh,
+            "time_center": self.time_center,
+            "duration": self.duration,
+            "velocity": self.velocity,
+            "temporal_gate": self.temporal_gate,
+        }
+
+        _require_same_device(*tensors.values())
+        _require_floating(**tensors)
+        _require_finite(**tensors)
+
+        if torch.any(self.scales <= 0):
+            raise ValueError("scales must be strictly positive")
+        if torch.any((self.opacities < 0) | (self.opacities > 1)):
+            raise ValueError("opacities must be in [0, 1]")
+        if torch.any(self.duration <= 0):
+            raise ValueError("duration must be strictly positive")
+        if torch.any((self.temporal_gate < 0) | (self.temporal_gate > 1)):
+            raise ValueError("temporal_gate must be in [0, 1]")
+
+        quat_norm = torch.linalg.vector_norm(self.quats, dim=-1)
+        if torch.any(quat_norm <= torch.finfo(self.quats.dtype).eps):
+            raise ValueError("quats must have non-zero norm")
+
+    def to(
+        self,
+        device: str | torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> "AnytimeGS":
+        """Move all Gaussian tensors in place and return ``self``."""
+
+        for name in self._tensor_names():
+            value = getattr(self, name)
+            setattr(
+                self,
+                name,
+                value.to(device=device, non_blocking=non_blocking),
+            )
         return self
 
     @torch.inference_mode()
-    def evaluate_time(self, time: float) -> GaussianFrame:
-        if not self.sequence.time_min <= time <= self.sequence.time_max:
-            raise ValueError(
-                f"time must be in [{self.sequence.time_min}, "
-                f"{self.sequence.time_max}], got {time}"
-            )
-        try:
-            evaluator = _EVALUATORS[self.representation]
-        except KeyError as error:
-            available = ", ".join(sorted(_EVALUATORS)) or "<none>"
-            raise RuntimeError(
-                f"No evaluator registered for representation "
-                f"'{self.representation}'. Available: {available}"
-            ) from error
-        frame = evaluator(self, float(time))
-        frame.validate()
-        return frame
+    def at_time(self, time: float) -> GaussianFrame:
+        """Evaluate the 4D Gaussians at normalized time ``time`` in [0, 1]."""
+
+        _validate_eval_time(time)
+        t = torch.as_tensor(float(time), dtype=self.means.dtype, device=self.device)
+
+        dt = t - self.time_center
+        means = self.means + dt[:, None] * self.velocity
+
+        temporal_weight = self.temporal_gate + (1.0 - self.temporal_gate) * torch.exp(
+            -0.5 * (dt / self.duration).square()
+        )
+        opacities = self.opacities * temporal_weight
+
+        quats = torch.nn.functional.normalize(self.quats, dim=-1)
+
+        return GaussianFrame(
+            means=means,
+            scales=self.scales,
+            quats=quats,
+            opacities=opacities,
+            sh=self.sh,
+        )
 
     @torch.inference_mode()
-    def evaluate_frame(self, frame: int) -> GaussianFrame:
-        return self.evaluate_time(self.sequence.frame_to_time(frame))
+    def at_frame(self, frame: int) -> GaussianFrame:
+        return self.at_time(self.sequence.frame_to_time(frame))
 
     def to_payload(self, *, cpu: bool = True) -> dict[str, Any]:
-        """Create a pickle-independent, weights-only-safe payload."""
+        """Return a fixed-schema, weights-only-safe serialization payload."""
 
-        def prepare(tensor: Tensor) -> Tensor:
-            value = tensor.detach()
+        def prepare(value: Tensor) -> Tensor:
+            value = value.detach()
             if cpu:
                 value = value.cpu()
             return value.contiguous()
 
+        gaussians = {
+            name: prepare(getattr(self, name)) for name in self._tensor_names()
+        }
+
         return {
             "format": _FORMAT_MAGIC,
             "schema_version": _SCHEMA_VERSION,
-            "representation": self.representation,
             "sequence": self.sequence.to_dict(),
-            "tensors": _map_tensor_tree(self.tensors, prepare),
+            "gaussians": gaussians,
             "metadata": self.metadata,
         }
 
     def save(self, path: str | Path, *, overwrite: bool = False) -> Path:
-        """Atomically save a portable model as CPU tensors."""
+        """Atomically save this AnytimeGS model as CPU tensors."""
 
         destination = Path(path).expanduser().resolve()
         if destination.exists() and not overwrite:
             raise FileExistsError(
-                f"output already exists: {destination}; pass overwrite=True to replace it"
+                f"output already exists: {destination}; "
+                "pass overwrite=True to replace it"
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
         )
         os.close(fd)
         temporary_path = Path(temporary_name)
+
         try:
             torch.save(self.to_payload(cpu=True), temporary_path)
             os.replace(temporary_path, destination)
         except Exception:
             temporary_path.unlink(missing_ok=True)
             raise
+
         return destination
 
     @classmethod
@@ -268,12 +333,21 @@ class Viewer4DGS:
         payload: Mapping[str, Any],
         *,
         device: str | torch.device = "cpu",
-    ) -> "Viewer4DGS":
+    ) -> "AnytimeGS":
         _validate_payload(payload)
+
+        gaussians = payload["gaussians"]
         model = cls(
-            representation=str(payload["representation"]),
             sequence=SequenceInfo.from_dict(payload["sequence"]),
-            tensors=payload["tensors"],
+            means=gaussians["means"],
+            scales=gaussians["scales"],
+            quats=gaussians["quats"],
+            opacities=gaussians["opacities"],
+            sh=gaussians["sh"],
+            time_center=gaussians["time_center"],
+            duration=gaussians["duration"],
+            velocity=gaussians["velocity"],
+            temporal_gate=gaussians["temporal_gate"],
             metadata=payload.get("metadata", {}),
         )
         return model.to(device)
@@ -285,12 +359,13 @@ class Viewer4DGS:
         *,
         device: str | torch.device = "cpu",
         mmap: bool = False,
-    ) -> "Viewer4DGS":
-        """Safely load a converted model without source-project dependencies."""
+    ) -> "AnytimeGS":
+        """Load an AnytimeGS file without any source-project dependency."""
 
         source = Path(path).expanduser().resolve()
         if not source.is_file():
             raise FileNotFoundError(source)
+
         payload = torch.load(
             source,
             map_location="cpu",
@@ -298,114 +373,124 @@ class Viewer4DGS:
             mmap=mmap,
         )
         if not isinstance(payload, Mapping):
-            raise ValueError("portable model root must be a mapping")
+            raise ValueError("AnytimeGS file root must be a mapping")
         return cls.from_payload(payload, device=device)
 
-    @classmethod
-    def import_source(
-        cls,
-        source: str | Path,
-        *,
-        importer: ModelImporter,
-        save_converted_to: str | Path | None = None,
-        overwrite: bool = False,
-        device: str | torch.device = "cpu",
-        **kwargs: Any,
-    ) -> "Viewer4DGS":
-        """Convert a source model and optionally persist the portable result.
-
-        The importer owns source-specific loading. It can run the original model
-        in another uv environment and return a plain portable payload.
-        """
-
-        converted = importer.convert(source, **kwargs)
-        if isinstance(converted, cls):
-            model = converted
-        elif isinstance(converted, Mapping):
-            model = cls.from_payload(converted, device="cpu")
-        else:
-            raise TypeError(
-                "importer.convert() must return Viewer4DGS or a portable payload"
-            )
-
-        if save_converted_to is not None:
-            model.save(save_converted_to, overwrite=overwrite)
-        return model.to(device)
-
-
-def _copy_tensor_tree(value: Mapping[str, Any]) -> TensorTree:
-    result: TensorTree = {}
-    for key, item in value.items():
-        if not isinstance(key, str) or not key:
-            raise TypeError("tensor tree keys must be non-empty strings")
-        if isinstance(item, Tensor):
-            result[key] = item
-        elif isinstance(item, Mapping):
-            result[key] = _copy_tensor_tree(item)
-        else:
-            raise TypeError(
-                f"tensor tree value at '{key}' must be a Tensor or mapping, "
-                f"got {type(item).__name__}"
-            )
-    return result
-
-
-def _map_tensor_tree(
-    tree: TensorTree,
-    function: Callable[[Tensor], Tensor],
-) -> TensorTree:
-    result: TensorTree = {}
-    for key, item in tree.items():
-        if isinstance(item, Tensor):
-            result[key] = function(item)
-        else:
-            result[key] = _map_tensor_tree(item, function)
-    return result
-
-
-def _iter_tensors(tree: TensorTree):
-    for item in tree.values():
-        if isinstance(item, Tensor):
-            yield item
-        else:
-            yield from _iter_tensors(item)
-
-
-def _validate_metadata(value: Mapping[str, Any]) -> dict[str, MetadataValue]:
-    def convert(item: Any, path: str) -> MetadataValue:
-        if item is None or isinstance(item, (bool, int, float, str)):
-            return item
-        if isinstance(item, Path):
-            return str(item)
-        if isinstance(item, (list, tuple)):
-            return [convert(child, f"{path}[]") for child in item]
-        if isinstance(item, Mapping):
-            output: dict[str, MetadataValue] = {}
-            for key, child in item.items():
-                if not isinstance(key, str):
-                    raise TypeError(f"metadata key at {path} must be a string")
-                output[key] = convert(child, f"{path}.{key}")
-            return output
-        raise TypeError(
-            f"metadata at {path} must be JSON-like, got {type(item).__name__}"
+    @staticmethod
+    def _tensor_names() -> tuple[str, ...]:
+        return (
+            "means",
+            "scales",
+            "quats",
+            "opacities",
+            "sh",
+            "time_center",
+            "duration",
+            "velocity",
+            "temporal_gate",
         )
 
-    return {str(key): convert(item, f"metadata.{key}") for key, item in value.items()}
+
+def _validate_eval_time(time: float) -> None:
+    value = float(time)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"time must be in [0, 1], got {time}")
+
+
+def _flatten_scalar_parameter(name: str, value: Tensor) -> Tensor:
+    if value.ndim == 2 and value.shape[1] == 1:
+        return value[:, 0]
+    if value.ndim != 1:
+        raise ValueError(f"{name} must have shape [N] or [N, 1], got {tuple(value.shape)}")
+    return value
+
+
+def _require_shape(name: str, value: Tensor, ndim: int, *, last_dim: int) -> None:
+    if not isinstance(value, Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.ndim != ndim or value.shape[-1] != last_dim:
+        raise ValueError(
+            f"{name} must have shape [N, {last_dim}], got {tuple(value.shape)}"
+        )
+
+
+def _require_exact_shape(name: str, value: Tensor, shape: tuple[int, ...]) -> None:
+    if not isinstance(value, Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tuple(value.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(value.shape)}")
+
+
+def _require_same_device(*values: Tensor) -> None:
+    devices = {value.device for value in values}
+    if len(devices) != 1:
+        raise ValueError(f"all Gaussian tensors must share one device, got {devices}")
+
+
+def _require_floating(**values: Tensor) -> None:
+    for name, value in values.items():
+        if not value.is_floating_point():
+            raise TypeError(f"{name} must use a floating-point dtype, got {value.dtype}")
+
+
+def _require_finite(**values: Tensor) -> None:
+    for name, value in values.items():
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} contains NaN or infinity")
+
+
+def _validate_metadata(value: Any, *, path: str = "metadata") -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{path} keys must be strings")
+            result[key] = _validate_metadata(item, path=f"{path}.{key}")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _validate_metadata(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"{path} must contain only JSON-like values, got {type(value).__name__}"
+    )
 
 
 def _validate_payload(payload: Mapping[str, Any]) -> None:
     if payload.get("format") != _FORMAT_MAGIC:
-        raise ValueError("not a viewer4d portable model")
-    version = payload.get("schema_version")
-    if version != _SCHEMA_VERSION:
         raise ValueError(
-            f"unsupported schema_version {version}; expected {_SCHEMA_VERSION}"
+            f"not an AnytimeGS file: expected format={_FORMAT_MAGIC!r}, "
+            f"got {payload.get('format')!r}"
         )
-    required = ("representation", "sequence", "tensors")
-    missing = [name for name in required if name not in payload]
+    if int(payload.get("schema_version", -1)) != _SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported AnytimeGS schema version: {payload.get('schema_version')!r}"
+        )
+
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, Mapping):
+        raise ValueError("payload['sequence'] must be a mapping")
+
+    gaussians = payload.get("gaussians")
+    if not isinstance(gaussians, Mapping):
+        raise ValueError("payload['gaussians'] must be a mapping")
+
+    required = set(AnytimeGS._tensor_names())
+    actual = set(gaussians.keys())
+    missing = required - actual
+    extra = actual - required
     if missing:
-        raise ValueError(f"portable model is missing fields: {', '.join(missing)}")
-    if not isinstance(payload["sequence"], Mapping):
-        raise TypeError("sequence must be a mapping")
-    if not isinstance(payload["tensors"], Mapping):
-        raise TypeError("tensors must be a mapping")
+        raise ValueError(f"missing Gaussian fields: {sorted(missing)}")
+    if extra:
+        raise ValueError(f"unexpected Gaussian fields: {sorted(extra)}")
+
+    for name in required:
+        if not isinstance(gaussians[name], Tensor):
+            raise TypeError(f"gaussians[{name!r}] must be a torch.Tensor")
+
+    _validate_metadata(payload.get("metadata", {}))

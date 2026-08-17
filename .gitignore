@@ -36,3 +36,4 @@ runs/
 # Temporary files
 *.tmp
 *.temp
+debug*
