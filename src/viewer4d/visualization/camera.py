@@ -35,6 +35,16 @@ class ViserCameraSnapshot:
     far: float
 
 
+@dataclass(frozen=True, slots=True)
+class ScreenProjection:
+    """World points projected into Viser/OpenCV normalized screen coordinates."""
+
+    xy: Tensor
+    depth: Tensor
+    in_front: Tensor
+    inside_viewport: Tensor
+
+
 def snapshot_viser_camera(camera: Any) -> ViserCameraSnapshot:
     """Copy all render-relevant Viser camera state.
 
@@ -114,6 +124,74 @@ def render_camera_from_viser(
         height=height,
         near=camera.near,
         far=camera.far,
+    )
+
+
+def project_world_to_screen(
+    points: Tensor,
+    camera: ViserCameraSnapshot,
+) -> ScreenProjection:
+    """Project world-space points to normalized OpenCV screen coordinates.
+
+    Returned ``xy`` uses the same convention as Viser scene pointer events:
+    ``(0,0)`` is the upper-left corner and ``(1,1)`` is the lower-right.
+    ``inside_viewport`` also requires the point to lie between the camera near
+    and far planes.
+    """
+
+    if not isinstance(points, Tensor):
+        raise TypeError("points must be a torch.Tensor")
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError(f"points must have shape [N,3], got {tuple(points.shape)}")
+    if not points.is_floating_point():
+        raise TypeError("points must use a floating dtype")
+
+    dtype = points.dtype
+    device = points.device
+
+    R_c2w = torch.as_tensor(
+        quaternion_wxyz_to_matrix(camera.wxyz),
+        dtype=dtype,
+        device=device,
+    )
+    position = torch.as_tensor(camera.position, dtype=dtype, device=device)
+
+    # Viser camera convention: p_world = R_c2w @ p_camera + position.
+    # For row-vector point storage this becomes p_camera = (p_world-t) @ R_c2w.
+    camera_points = (points - position) @ R_c2w
+    depth = camera_points[:, 2]
+
+    safe_depth = torch.where(
+        depth.abs() > torch.finfo(dtype).eps,
+        depth,
+        torch.ones_like(depth),
+    )
+    xy = camera_points[:, :2] / safe_depth[:, None]
+
+    tan_half_fov = math.tan(0.5 * float(camera.fov))
+    if not math.isfinite(tan_half_fov) or tan_half_fov <= 0.0:
+        raise ValueError(f"invalid camera fov: {camera.fov}")
+
+    xy = xy / tan_half_fov
+    xy = xy.clone()
+    xy[:, 0] = xy[:, 0] / float(camera.aspect)
+    xy = (xy + 1.0) * 0.5
+
+    in_front = (depth >= float(camera.near)) & (depth <= float(camera.far))
+    inside = (
+        in_front
+        & torch.isfinite(xy).all(dim=-1)
+        & (xy[:, 0] >= 0.0)
+        & (xy[:, 0] <= 1.0)
+        & (xy[:, 1] >= 0.0)
+        & (xy[:, 1] <= 1.0)
+    )
+
+    return ScreenProjection(
+        xy=xy,
+        depth=depth,
+        in_front=in_front,
+        inside_viewport=inside,
     )
 
 

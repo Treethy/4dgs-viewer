@@ -3,8 +3,10 @@ from __future__ import annotations
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 
 from viewer4d.core.camera import PinholeCamera
@@ -19,7 +21,18 @@ from viewer4d.visualization.modes import (
     RenderMode,
     estimate_default_point_size,
 )
-from viewer4d.visualization.renderer import GsplatRenderer
+from viewer4d.visualization.renderer import (
+    GaussianOverlayRequest,
+    GsplatRenderer,
+)
+from viewer4d.visualization.selection import (
+    SelectionHighlight,
+    SelectionMode,
+    SelectionState,
+    inspect_gaussian,
+    pick_gaussian,
+    select_gaussians_in_rect,
+)
 from viewer4d.visualization.viewer import (
     apply_initial_camera,
     initial_view,
@@ -37,6 +50,24 @@ _PLAYBACK_SPEEDS: dict[str, float] = {
     "1.50×": 1.50,
     "2.00×": 2.00,
 }
+
+_PREVIEW_SCALE = 0.50
+_PREVIEW_JPEG_QUALITY = 70
+_PREVIEW_RADIUS_CLIP = 0.75
+_CAMERA_SETTLE_SECONDS = 0.12
+_BOX_DEPTH_MAX_WIDTH = 512
+
+
+@dataclass(frozen=True, slots=True)
+class PresentedRenderState:
+    """The Splat frame/camera that is actually visible in the browser."""
+
+    frame_index: int
+    camera: ViserCameraSnapshot
+    width: int
+    height: int
+    camera_epoch: int
+    preview: bool
 
 
 class Gaussian4DViewer:
@@ -116,6 +147,7 @@ class Gaussian4DViewer:
         print(f"  Source FPS:        {self.model.sequence.fps:g}")
         print("  Playback speed:    browser GUI")
         print("  Render modes:      Splat / Ellipsoid / Centers")
+        print("  Selection modes:   Camera / Single / Box")
 
         @self.server.on_client_connect
         def _on_connect(client: Any) -> None:
@@ -156,7 +188,7 @@ class Gaussian4DViewer:
 
 
 class _Client4DSession:
-    """Per-browser GUI, playback clock, and render state."""
+    """Per-browser GUI, playback clock, render state, and Gaussian selection."""
 
     def __init__(
         self,
@@ -176,6 +208,9 @@ class _Client4DSession:
         self.renderer = renderer
         self.num_frames = model.sequence.num_frames
         self.source_fps = float(model.sequence.fps)
+        self._max_width = int(max_width)
+        self._fallback_aspect = float(fallback_aspect)
+        self._presented_splat_state: PresentedRenderState | None = None
 
         self._state_lock = threading.RLock()
         self._play_condition = threading.Condition(self._state_lock)
@@ -187,6 +222,16 @@ class _Client4DSession:
         self._play_anchor_frame = 0
         self._play_anchor_wall = time.monotonic()
         self._stopped = False
+
+        self.selection_state = SelectionState()
+        self.selection_highlight = SelectionHighlight(
+            client,
+            base_point_size=base_point_size,
+        )
+        self._selection_click_callback: Any | None = None
+        self._selection_rect_callback: Any | None = None
+        self._selection_camera_lock: dict[str, Any] | None = None
+        self._restoring_selection_camera = False
 
         inspection = InspectionScene(
             client,
@@ -215,11 +260,18 @@ class _Client4DSession:
 
         @client.camera.on_update
         def _on_camera_update(camera: Any) -> None:
-            self.worker.update_camera(snapshot_viser_camera(camera))
+            if self.selection_state.mode is SelectionMode.CAMERA:
+                self.worker.update_camera(snapshot_viser_camera(camera))
+                return
+            self._restore_selection_camera(camera)
 
         set_client_camera(client, pose)
-        self.worker.update_camera(snapshot_viser_camera(client.camera))
+        self.worker.update_camera(
+            snapshot_viser_camera(client.camera),
+            interactive=False,
+        )
         self.worker.update_frame(0)
+        self._refresh_selection(layout=True)
 
         self._play_thread = threading.Thread(
             target=self._play_loop,
@@ -229,95 +281,281 @@ class _Client4DSession:
         self._play_thread.start()
 
     def _build_gui(self, base_point_size: float) -> None:
-        self.mode_dropdown = self.client.gui.add_dropdown(
-            "Render mode",
-            options=tuple(mode.value for mode in RenderMode),
-            initial_value=RenderMode.SPLAT.value,
-        )
+        tab_group = self.client.gui.add_tab_group()
 
-        self.frame_slider = self.client.gui.add_slider(
-            "Frame",
-            min=0,
-            max=self.num_frames - 1,
-            step=1,
-            initial_value=0,
-        )
-        self.normalized_time = self.client.gui.add_number(
-            "Normalized time",
-            initial_value=0.0,
-            disabled=True,
-        )
-        self.play_checkbox = self.client.gui.add_checkbox(
-            "Play",
-            initial_value=False,
-        )
-        self.speed_dropdown = self.client.gui.add_dropdown(
-            "Playback speed",
-            options=tuple(_PLAYBACK_SPEEDS.keys()),
-            initial_value="1.00×",
-        )
-        self.loop_checkbox = self.client.gui.add_checkbox(
-            "Loop",
-            initial_value=True,
-        )
-        self.source_fps_number = self.client.gui.add_number(
-            "Source FPS",
-            initial_value=self.source_fps,
-            disabled=True,
-        )
-        self.effective_fps_number = self.client.gui.add_number(
-            "Effective FPS",
-            initial_value=self.source_fps,
-            disabled=True,
-        )
-        self.displayed_frame_number = self.client.gui.add_number(
-            "Displayed frame",
-            initial_value=0,
-            disabled=True,
-        )
-        self.render_fps_number = self.client.gui.add_number(
-            "Render FPS",
-            initial_value=0.0,
-            disabled=True,
-        )
+        with tab_group.add_tab("Render"):
+            self.mode_dropdown = self.client.gui.add_dropdown(
+                "Render mode",
+                options=tuple(mode.value for mode in RenderMode),
+                initial_value=RenderMode.SPLAT.value,
+            )
 
-        self.point_size_slider = self.client.gui.add_slider(
-            "Point size",
-            min=0.10,
-            max=5.00,
-            step=0.05,
-            initial_value=1.00,
-            visible=False,
-        )
-        self.point_sample_slider = self.client.gui.add_slider(
-            "Center sampling (%)",
-            min=1,
-            max=100,
-            step=1,
-            initial_value=10,
-            visible=False,
-        )
-        self.point_count_number = self.client.gui.add_number(
-            "Visible centers",
-            initial_value=0,
-            disabled=True,
-            visible=False,
-        )
+            self.point_size_slider = self.client.gui.add_slider(
+                "Point size",
+                min=0.10,
+                max=5.00,
+                step=0.05,
+                initial_value=1.00,
+                visible=False,
+            )
+            self.point_sample_slider = self.client.gui.add_slider(
+                "Center sampling (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=10,
+                visible=False,
+            )
+            self.point_count_number = self.client.gui.add_number(
+                "Visible centers",
+                initial_value=0,
+                disabled=True,
+                visible=False,
+            )
 
-        self.ellipsoid_sample_slider = self.client.gui.add_slider(
-            "Ellipsoid sampling (%)",
-            min=1,
-            max=100,
-            step=1,
-            initial_value=5,
-            visible=False,
+            self.ellipsoid_sample_slider = self.client.gui.add_slider(
+                "Ellipsoid sampling (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=5,
+                visible=False,
+            )
+            self.ellipsoid_count_number = self.client.gui.add_number(
+                "Visible ellipsoids",
+                initial_value=0,
+                disabled=True,
+                visible=False,
+            )
+
+        with tab_group.add_tab("Trajectory"):
+            self.client.gui.add_markdown(
+                "Trajectory visualization will be added in the next phase."
+            )
+
+        with tab_group.add_tab("Selection"):
+            self.client.gui.add_markdown("**Selection mode**")
+            self.selection_camera_button = self.client.gui.add_button(
+                "Camera",
+                color="dark",
+                hint="Normal camera navigation. This is the default mode.",
+            )
+            self.selection_single_button = self.client.gui.add_button(
+                "Single",
+                hint="Lock the current camera and click one Gaussian center.",
+            )
+            self.selection_box_button = self.client.gui.add_button(
+                "Box",
+                hint="Lock the current camera and drag a rectangle to select surface Gaussians.",
+            )
+
+            self.selection_highlight_checkbox = self.client.gui.add_checkbox(
+                "Highlight selection",
+                initial_value=True,
+            )
+            self.box_depth_tolerance_slider = self.client.gui.add_slider(
+                "Box depth tolerance (%)",
+                min=1.0,
+                max=20.0,
+                step=0.5,
+                initial_value=5.0,
+                hint=(
+                    "Keep box-selected Gaussian centers whose camera depth is close "
+                    "to the locally rendered surface depth."
+                ),
+            )
+            self.box_outline_checkbox = self.client.gui.add_checkbox(
+                "Show box Gaussian outlines",
+                initial_value=False,
+            )
+            self.box_outline_limit_slider = self.client.gui.add_slider(
+                "Max box outlines",
+                min=10,
+                max=500,
+                step=10,
+                initial_value=200,
+                visible=False,
+            )
+            self.selection_status = self.client.gui.add_text(
+                "Status",
+                "No Gaussian selected",
+                disabled=True,
+            )
+
+            self.single_selection_folder = self.client.gui.add_folder(
+                "Selected Gaussian",
+                expand_by_default=True,
+                visible=False,
+            )
+            with self.single_selection_folder:
+                self.selected_index_number = self.client.gui.add_number(
+                    "Gaussian index",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.selected_time_number = self.client.gui.add_number(
+                    "Normalized time",
+                    initial_value=0.0,
+                    disabled=True,
+                )
+
+                motion_folder = self.client.gui.add_folder(
+                    "Motion",
+                    expand_by_default=True,
+                )
+                with motion_folder:
+                    self.selected_velocity = self.client.gui.add_vector3(
+                        "Velocity",
+                        initial_value=(0.0, 0.0, 0.0),
+                        disabled=True,
+                    )
+                    self.selected_speed = self.client.gui.add_number(
+                        "Speed",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+
+                temporal_folder = self.client.gui.add_folder(
+                    "Temporal",
+                    expand_by_default=True,
+                )
+                with temporal_folder:
+                    self.selected_time_center = self.client.gui.add_number(
+                        "Time center",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+                    self.selected_duration = self.client.gui.add_number(
+                        "Duration",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+                    self.selected_support_start = self.client.gui.add_number(
+                        "3σ support start",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+                    self.selected_support_end = self.client.gui.add_number(
+                        "3σ support end",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+                    self.selected_temporal_gate = self.client.gui.add_number(
+                        "Temporal gate",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+
+                spatial_folder = self.client.gui.add_folder(
+                    "Spatial",
+                    expand_by_default=False,
+                )
+                with spatial_folder:
+                    self.selected_base_center = self.client.gui.add_vector3(
+                        "Center @ time center",
+                        initial_value=(0.0, 0.0, 0.0),
+                        disabled=True,
+                    )
+                    self.selected_current_center = self.client.gui.add_vector3(
+                        "Current center",
+                        initial_value=(0.0, 0.0, 0.0),
+                        disabled=True,
+                    )
+                    self.selected_scale = self.client.gui.add_vector3(
+                        "Scale",
+                        initial_value=(0.0, 0.0, 0.0),
+                        disabled=True,
+                    )
+                    self.selected_quaternion = self.client.gui.add_text(
+                        "Quaternion (wxyz)",
+                        "(1, 0, 0, 0)",
+                        disabled=True,
+                    )
+
+                appearance_folder = self.client.gui.add_folder(
+                    "Appearance",
+                    expand_by_default=False,
+                )
+                with appearance_folder:
+                    self.selected_base_opacity = self.client.gui.add_number(
+                        "Base opacity",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+                    self.selected_current_opacity = self.client.gui.add_number(
+                        "Current opacity",
+                        initial_value=0.0,
+                        disabled=True,
+                    )
+
+            self.box_selection_folder = self.client.gui.add_folder(
+                "Selected Gaussians",
+                expand_by_default=True,
+                visible=False,
+            )
+            with self.box_selection_folder:
+                self.selected_count_number = self.client.gui.add_number(
+                    "Count",
+                    initial_value=0,
+                    disabled=True,
+                )
+
+            self.clear_selection_button = self.client.gui.add_button(
+                "Clear selection",
+                visible=False,
+            )
+
+        # Timeline is shared by all three functional tabs.
+        timeline_folder = self.client.gui.add_folder(
+            "Timeline",
+            expand_by_default=True,
         )
-        self.ellipsoid_count_number = self.client.gui.add_number(
-            "Visible ellipsoids",
-            initial_value=0,
-            disabled=True,
-            visible=False,
-        )
+        with timeline_folder:
+            self.frame_slider = self.client.gui.add_slider(
+                "Frame",
+                min=0,
+                max=self.num_frames - 1,
+                step=1,
+                initial_value=0,
+            )
+            self.normalized_time = self.client.gui.add_number(
+                "Normalized time",
+                initial_value=0.0,
+                disabled=True,
+            )
+            self.play_checkbox = self.client.gui.add_checkbox(
+                "Play",
+                initial_value=False,
+            )
+            self.speed_dropdown = self.client.gui.add_dropdown(
+                "Playback speed",
+                options=tuple(_PLAYBACK_SPEEDS.keys()),
+                initial_value="1.00×",
+            )
+            self.loop_checkbox = self.client.gui.add_checkbox(
+                "Loop",
+                initial_value=True,
+            )
+            self.source_fps_number = self.client.gui.add_number(
+                "Source FPS",
+                initial_value=self.source_fps,
+                disabled=True,
+            )
+            self.effective_fps_number = self.client.gui.add_number(
+                "Effective FPS",
+                initial_value=self.source_fps,
+                disabled=True,
+            )
+            self.displayed_frame_number = self.client.gui.add_number(
+                "Displayed frame",
+                initial_value=0,
+                disabled=True,
+            )
+            self.render_fps_number = self.client.gui.add_number(
+                "Render FPS",
+                initial_value=0.0,
+                disabled=True,
+            )
 
         self._base_point_size = float(base_point_size)
 
@@ -368,6 +606,46 @@ class _Client4DSession:
             if self.mode is RenderMode.ELLIPSOID:
                 self.worker.refresh()
 
+        @self.selection_camera_button.on_click
+        async def _selection_camera_click(_: Any) -> None:
+            self.set_selection_mode(SelectionMode.CAMERA)
+
+        @self.selection_single_button.on_click
+        async def _selection_single_click(_: Any) -> None:
+            self.set_selection_mode(SelectionMode.SINGLE)
+
+        @self.selection_box_button.on_click
+        async def _selection_box_click(_: Any) -> None:
+            self.set_selection_mode(SelectionMode.BOX)
+
+        @self.selection_highlight_checkbox.on_update
+        async def _selection_highlight_update(_: Any) -> None:
+            self.selection_state.highlight_enabled = bool(
+                self.selection_highlight_checkbox.value
+            )
+            self._sync_selection_render_state()
+            self._refresh_selection(layout=False)
+
+        @self.box_outline_checkbox.on_update
+        async def _box_outline_update(_: Any) -> None:
+            enabled = bool(self.box_outline_checkbox.value)
+            self.box_outline_limit_slider.visible = enabled
+            self._sync_selection_render_state()
+
+        @self.box_outline_limit_slider.on_update
+        async def _box_outline_limit_update(_: Any) -> None:
+            self._sync_selection_render_state()
+
+        @self.clear_selection_button.on_click
+        async def _clear_selection(_: Any) -> None:
+            self.selection_state.clear()
+            self.selection_highlight.clear()
+            self._sync_selection_render_state()
+            self._refresh_selection_gui(layout=True)
+
+        self._refresh_selection_mode_buttons()
+        self._refresh_selection_gui(layout=True)
+
     @property
     def mode(self) -> RenderMode:
         with self._state_lock:
@@ -388,6 +666,45 @@ class _Client4DSession:
 
         self.inspection.set_mode(mode)
         self.worker.update_mode(mode)
+        self._sync_selection_render_state()
+        self._refresh_selection(layout=False)
+
+    def set_selection_mode(self, mode: SelectionMode) -> None:
+        if not isinstance(mode, SelectionMode):
+            mode = SelectionMode(mode)
+
+        old_mode = self.selection_state.mode
+        if old_mode is mode:
+            self._refresh_selection_mode_buttons()
+            return
+
+        self._remove_selection_pointer_callbacks()
+        self.selection_state.set_mode(mode)
+
+        if mode is SelectionMode.CAMERA:
+            self._selection_camera_lock = None
+            self.worker.update_camera(
+                snapshot_viser_camera(self.client.camera),
+                interactive=False,
+            )
+        else:
+            self._capture_selection_camera()
+            self._install_selection_pointer_callback(mode)
+
+        self._refresh_selection_mode_buttons()
+        self._refresh_selection_gui(layout=True)
+
+    def _refresh_selection_mode_buttons(self) -> None:
+        mode = self.selection_state.mode
+        self.selection_camera_button.color = (
+            "dark" if mode is SelectionMode.CAMERA else None
+        )
+        self.selection_single_button.color = (
+            "dark" if mode is SelectionMode.SINGLE else None
+        )
+        self.selection_box_button.color = (
+            "dark" if mode is SelectionMode.BOX else None
+        )
 
     def set_frame(self, frame_index: int, *, reanchor: bool) -> None:
         frame_index = max(0, min(self.num_frames - 1, int(frame_index)))
@@ -406,6 +723,10 @@ class _Client4DSession:
             )
             self.worker.update_frame(frame_index)
             self._play_condition.notify_all()
+
+        # Timeline playback updates values and native geometry only. It must not
+        # touch GUI folder visibility; doing so makes the Timeline jump vertically.
+        self._refresh_selection(layout=False)
 
     def set_playing(self, playing: bool) -> None:
         with self._play_condition:
@@ -430,6 +751,9 @@ class _Client4DSession:
             self._play_condition.notify_all()
 
     def stop(self) -> None:
+        self._remove_selection_pointer_callbacks()
+        self.selection_highlight.clear()
+
         with self._play_condition:
             self._stopped = True
             self._playing = False
@@ -438,6 +762,275 @@ class _Client4DSession:
         self.worker.stop()
         if threading.current_thread() is not self._play_thread:
             self._play_thread.join(timeout=2.0)
+
+    def _current_normalized_time(self) -> float:
+        with self._state_lock:
+            frame_index = self._frame_index
+        return self.model.sequence.frame_to_time(frame_index)
+
+    def _capture_selection_camera(self) -> None:
+        camera = self.client.camera
+        self._selection_camera_lock = {
+            "position": np.asarray(camera.position, dtype=np.float64).copy(),
+            "look_at": np.asarray(camera.look_at, dtype=np.float64).copy(),
+            "up_direction": np.asarray(camera.up_direction, dtype=np.float64).copy(),
+            "fov": float(camera.fov),
+        }
+
+    def _restore_selection_camera(self, camera: Any) -> None:
+        lock = self._selection_camera_lock
+        if lock is None or self._restoring_selection_camera:
+            return
+
+        unchanged = (
+            np.allclose(camera.position, lock["position"], rtol=0.0, atol=1e-9)
+            and np.allclose(camera.look_at, lock["look_at"], rtol=0.0, atol=1e-9)
+            and np.allclose(
+                camera.up_direction,
+                lock["up_direction"],
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and abs(float(camera.fov) - float(lock["fov"])) <= 1e-9
+        )
+        if unchanged:
+            return
+
+        self._restoring_selection_camera = True
+        try:
+            with self.client.atomic():
+                camera.position = lock["position"]
+                camera.look_at = lock["look_at"]
+                camera.up_direction = lock["up_direction"]
+                camera.fov = float(lock["fov"])
+            self.client.flush()
+        finally:
+            self._restoring_selection_camera = False
+
+    def _selection_reference_state(
+        self,
+    ) -> tuple[int, float, ViserCameraSnapshot]:
+        """Return the frame/camera that the user is actually looking at."""
+
+        if self.mode is RenderMode.SPLAT and self._presented_splat_state is not None:
+            state = self._presented_splat_state
+            return (
+                state.frame_index,
+                self.model.sequence.frame_to_time(state.frame_index),
+                state.camera,
+            )
+
+        with self._state_lock:
+            frame_index = self._frame_index
+        return (
+            frame_index,
+            self.model.sequence.frame_to_time(frame_index),
+            snapshot_viser_camera(self.client.camera),
+        )
+
+    def _surface_depth_for_selection(
+        self,
+        *,
+        frame_index: int,
+        camera_snapshot: ViserCameraSnapshot,
+    ) -> np.ndarray:
+        """Render a small expected-depth map for surface-aware box selection."""
+
+        frame = self.renderer.prepare_frame(self.model.at_frame(frame_index))
+        depth_max_width = min(self._max_width, _BOX_DEPTH_MAX_WIDTH)
+        width, height = render_size(
+            camera_snapshot,
+            max_width=depth_max_width,
+            fallback_aspect=self._fallback_aspect,
+        )
+        camera = render_camera_from_viser(
+            camera_snapshot,
+            width=width,
+            height=height,
+            device=self.renderer.device,
+            dtype=frame.means.dtype,
+        )
+        return self.renderer.render_depth(
+            frame,
+            camera,
+            radius_clip=max(self.renderer.radius_clip, _PREVIEW_RADIUS_CLIP),
+        )
+
+    def _install_selection_pointer_callback(self, mode: SelectionMode) -> None:
+        if mode is SelectionMode.SINGLE:
+
+            @self.client.scene.on_click()
+            async def _single_click(event: Any) -> None:
+                if self.selection_state.mode is not SelectionMode.SINGLE:
+                    return
+                _, normalized_time, camera_snapshot = self._selection_reference_state()
+                index = pick_gaussian(
+                    self.model,
+                    normalized_time=normalized_time,
+                    camera=camera_snapshot,
+                    screen_pos=event.screen_pos,
+                )
+                if index is None:
+                    self.selection_state.clear()
+                else:
+                    self.selection_state.replace(
+                        (index,),
+                        source=SelectionMode.SINGLE,
+                    )
+                self._sync_selection_render_state()
+                self._refresh_selection(layout=True)
+
+            self._selection_click_callback = _single_click
+            return
+
+        if mode is SelectionMode.BOX:
+
+            @self.client.scene.on_rect_select()
+            async def _box_select(event: Any) -> None:
+                if self.selection_state.mode is not SelectionMode.BOX:
+                    return
+
+                frame_index, normalized_time, camera_snapshot = (
+                    self._selection_reference_state()
+                )
+                surface_depth = self._surface_depth_for_selection(
+                    frame_index=frame_index,
+                    camera_snapshot=camera_snapshot,
+                )
+                indices = select_gaussians_in_rect(
+                    self.model,
+                    normalized_time=normalized_time,
+                    camera=camera_snapshot,
+                    screen_min=event.screen_min,
+                    screen_max=event.screen_max,
+                    surface_depth=surface_depth,
+                    surface_depth_tolerance=(
+                        float(self.box_depth_tolerance_slider.value) / 100.0
+                    ),
+                )
+                self.selection_state.replace(
+                    indices,
+                    source=SelectionMode.BOX,
+                )
+                self._sync_selection_render_state()
+                self._refresh_selection(layout=True)
+
+            self._selection_rect_callback = _box_select
+
+    def _remove_selection_pointer_callbacks(self) -> None:
+        if self._selection_click_callback is not None:
+            self.client.scene.remove_click_callback(self._selection_click_callback)
+            self._selection_click_callback = None
+        if self._selection_rect_callback is not None:
+            self.client.scene.remove_rect_select_callback(
+                self._selection_rect_callback
+            )
+            self._selection_rect_callback = None
+
+    def _sync_selection_render_state(self) -> None:
+        """Send selection identity to the Splat worker without copying Gaussian data."""
+
+        self.worker.update_selection(
+            indices=self.selection_state.selected.indices,
+            source=self.selection_state.selection_source,
+            highlight_enabled=self.selection_state.highlight_enabled,
+            box_outlines=bool(self.box_outline_checkbox.value),
+            box_outline_limit=int(self.box_outline_limit_slider.value),
+        )
+
+    def _refresh_selection(self, *, layout: bool) -> None:
+        normalized_time = self._current_normalized_time()
+
+        # Splat highlighting is baked into the exact rendered image/camera so it
+        # never races ahead of the delayed background during camera interaction.
+        if self.mode is RenderMode.SPLAT:
+            self.selection_highlight.clear()
+        else:
+            self.selection_highlight.set_visible(
+                self.selection_state.highlight_enabled
+            )
+            if self.selection_state.selected and self.selection_state.highlight_enabled:
+                self.selection_highlight.update(
+                    self.model,
+                    indices=self.selection_state.selected.indices,
+                    normalized_time=normalized_time,
+                    mode=(
+                        self.selection_state.selection_source
+                        or self.selection_state.mode
+                    ),
+                )
+            else:
+                self.selection_highlight.clear()
+
+        self._refresh_selection_gui(
+            normalized_time=normalized_time,
+            layout=layout,
+        )
+
+    def _refresh_selection_gui(
+        self,
+        *,
+        normalized_time: float | None = None,
+        layout: bool,
+    ) -> None:
+        if normalized_time is None:
+            normalized_time = self._current_normalized_time()
+
+        count = len(self.selection_state.selected)
+        source = self.selection_state.selection_source
+        single_visible = source is SelectionMode.SINGLE and count == 1
+        box_visible = source is SelectionMode.BOX and count > 0
+        clear_visible = count > 0
+
+        # Only explicit selection/mode changes may alter layout. Timeline frame
+        # changes update values below but never folder visibility.
+        if layout:
+            if self.clear_selection_button.visible != clear_visible:
+                self.clear_selection_button.visible = clear_visible
+            if self.single_selection_folder.visible != single_visible:
+                self.single_selection_folder.visible = single_visible
+            if self.box_selection_folder.visible != box_visible:
+                self.box_selection_folder.visible = box_visible
+
+        if count == 0:
+            if self.selection_status.value != "No Gaussian selected":
+                self.selection_status.value = "No Gaussian selected"
+            return
+
+        if single_visible:
+            index = self.selection_state.selected.indices[0]
+            inspection = inspect_gaussian(
+                self.model,
+                index,
+                normalized_time,
+            )
+            status = f"Gaussian #{index}"
+            if self.selection_status.value != status:
+                self.selection_status.value = status
+
+            self.selected_index_number.value = inspection.index
+            self.selected_time_number.value = inspection.normalized_time
+            self.selected_velocity.value = inspection.velocity
+            self.selected_speed.value = inspection.speed
+            self.selected_time_center.value = inspection.time_center
+            self.selected_duration.value = inspection.duration
+            self.selected_support_start.value = inspection.support_start_3sigma
+            self.selected_support_end.value = inspection.support_end_3sigma
+            self.selected_temporal_gate.value = inspection.temporal_gate
+            self.selected_base_center.value = inspection.base_center
+            self.selected_current_center.value = inspection.current_center
+            self.selected_scale.value = inspection.scale
+            self.selected_quaternion.value = _format_quaternion(
+                inspection.quaternion_wxyz
+            )
+            self.selected_base_opacity.value = inspection.base_opacity
+            self.selected_current_opacity.value = inspection.current_opacity
+            return
+
+        status = f"{count:,} Gaussians selected"
+        if self.selection_status.value != status:
+            self.selection_status.value = status
+        self.selected_count_number.value = count
 
     def _reanchor_locked(self) -> None:
         self._play_anchor_frame = self._frame_index
@@ -485,17 +1078,15 @@ class _Client4DSession:
         mode: RenderMode,
         frame_index: int,
         render_fps: float,
+        presented_state: PresentedRenderState | None = None,
     ) -> None:
-        """Update GUI with what actually reached the browser.
-
-        The timeline may advance at 60 source FPS while rendering can be much
-        slower. In that case intermediate source frames are intentionally
-        skipped, but every completed render is still presented.
-        """
+        """Update GUI and remember the exact Splat image currently displayed."""
 
         with self._state_lock:
             if mode != self._mode:
                 return
+            if presented_state is not None:
+                self._presented_splat_state = presented_state
 
         self.displayed_frame_number.value = int(frame_index)
         self.render_fps_number.value = float(render_fps)
@@ -517,7 +1108,14 @@ class _Client4DSession:
 
 
 class _DynamicRenderWorker:
-    """Latest-state-wins worker over (camera, frame index, render mode)."""
+    """Render worker with separate timeline and interactive-camera policies.
+
+    Timeline updates may present completed older frames when rendering is slower
+    than source FPS. Camera updates are stricter: any render produced from a
+    stale camera epoch is discarded. While the camera is moving, a lower
+    resolution preview is rendered; after it settles, a full-resolution image is
+    generated automatically.
+    """
 
     def __init__(
         self,
@@ -546,27 +1144,22 @@ class _DynamicRenderWorker:
         self._camera: ViserCameraSnapshot | None = None
         self._frame_index = 0
         self._mode = RenderMode.SPLAT
-
-        # `_serial` still coalesces pending requests: while one frame is being
-        # rendered, any number of camera/time updates collapse into the latest
-        # request. It is deliberately NOT used to discard a completed render.
-        self._serial = 0
-
-        # Results are discarded only across render-mode changes. This prevents
-        # an old Splat image from overwriting Ellipsoid/Centers after switching
-        # modes, without causing playback starvation when rendering < source FPS.
         self._mode_epoch = 0
+        self._camera_epoch = 0
+        self._selection_epoch = 0
+        self._last_camera_update_wall = 0.0
+        self._full_render_due = False
+
+        self._selection_indices: tuple[int, ...] = ()
+        self._selection_source: SelectionMode | None = None
+        self._selection_highlight_enabled = True
+        self._box_outlines = False
+        self._box_outline_limit = 200
 
         self._pending = False
         self._stopped = False
         self._render_fps_ema = 0.0
 
-        # Cache the evaluated GaussianFrame for the current timeline frame.
-        #
-        # Camera motion must NOT call model.at_frame() again when time has not
-        # changed. Without this cache, every mouse event recomputes dynamic
-        # means + temporal opacity for all Gaussians before rasterization,
-        # making the 4D viewer much less responsive than the static 3D viewer.
         self._cached_frame_index: int | None = None
         self._cached_frame: GaussianFrame | None = None
 
@@ -577,9 +1170,30 @@ class _DynamicRenderWorker:
         )
         self._thread.start()
 
-    def update_camera(self, camera: ViserCameraSnapshot) -> None:
+    def update_camera(
+        self,
+        camera: ViserCameraSnapshot,
+        *,
+        interactive: bool = True,
+    ) -> None:
+        """Update the requested camera.
+
+        ``interactive=True`` is reserved for real browser camera motion and
+        enables the low-resolution preview -> settled full-resolution path.
+        Programmatic camera synchronization (initialization or leaving a
+        locked selection mode) uses ``interactive=False`` so simply pressing
+        the Camera button never flashes a blurry preview.
+        """
+
         with self._condition:
             self._camera = camera
+            self._camera_epoch += 1
+            if interactive:
+                self._last_camera_update_wall = time.monotonic()
+                self._full_render_due = True
+            else:
+                self._last_camera_update_wall = 0.0
+                self._full_render_due = False
             if self._mode is RenderMode.SPLAT:
                 self._queue_locked()
 
@@ -594,6 +1208,25 @@ class _DynamicRenderWorker:
                 self._mode = mode
                 self._mode_epoch += 1
             self._queue_locked()
+
+    def update_selection(
+        self,
+        *,
+        indices: tuple[int, ...],
+        source: SelectionMode | None,
+        highlight_enabled: bool,
+        box_outlines: bool,
+        box_outline_limit: int,
+    ) -> None:
+        with self._condition:
+            self._selection_indices = tuple(int(index) for index in indices)
+            self._selection_source = source
+            self._selection_highlight_enabled = bool(highlight_enabled)
+            self._box_outlines = bool(box_outlines)
+            self._box_outline_limit = max(0, int(box_outline_limit))
+            self._selection_epoch += 1
+            if self._mode is RenderMode.SPLAT:
+                self._queue_locked()
 
     def refresh(self) -> None:
         with self._condition:
@@ -610,15 +1243,44 @@ class _DynamicRenderWorker:
     def _queue_locked(self) -> None:
         if self._stopped:
             return
-        self._serial += 1
         self._pending = True
         self._condition.notify()
 
-    def _can_present(
+    def _wait_for_work_locked(self) -> bool:
+        while not self._pending and not self._stopped:
+            timeout: float | None = None
+            if (
+                self._mode is RenderMode.SPLAT
+                and self._full_render_due
+                and self._camera is not None
+            ):
+                remaining = _CAMERA_SETTLE_SECONDS - (
+                    time.monotonic() - self._last_camera_update_wall
+                )
+                if remaining <= 0.0:
+                    self._pending = True
+                    break
+                timeout = remaining
+            self._condition.wait(timeout=timeout)
+        return not self._stopped
+
+    def _can_present_splat(
         self,
-        mode: RenderMode,
+        *,
         mode_epoch: int,
+        camera_epoch: int,
+        selection_epoch: int,
     ) -> bool:
+        with self._condition:
+            return (
+                not self._stopped
+                and self._mode is RenderMode.SPLAT
+                and self._mode_epoch == mode_epoch
+                and self._camera_epoch == camera_epoch
+                and self._selection_epoch == selection_epoch
+            )
+
+    def _can_present_native(self, mode: RenderMode, mode_epoch: int) -> bool:
         with self._condition:
             return (
                 not self._stopped
@@ -634,54 +1296,93 @@ class _DynamicRenderWorker:
         if self._render_fps_ema <= 0.0:
             self._render_fps_ema = instant
         else:
-            self._render_fps_ema = (
-                0.90 * self._render_fps_ema
-                + 0.10 * instant
-            )
+            self._render_fps_ema = 0.90 * self._render_fps_ema + 0.10 * instant
         return self._render_fps_ema
 
     def _frame_for(self, frame_index: int) -> GaussianFrame:
-        """Return the evaluated frame, recomputing only when time changes.
-
-        This method is called only from the render worker thread, so the cache
-        itself needs no additional lock.
-
-        - camera-only update: reuse the existing GaussianFrame
-        - timeline update: evaluate AnytimeGS exactly once for the new frame
-        """
-
         if (
             self._cached_frame is not None
             and self._cached_frame_index == frame_index
         ):
             return self._cached_frame
 
-        frame = self.model.at_frame(frame_index)
-
-        # Prepare once here rather than repeatedly inside camera-only renders.
-        # Since the AnytimeGS model already lives on renderer.device this
-        # normally returns the frame directly, but it also guarantees the
-        # cached tensors have the layout expected by gsplat.
-        frame = self.renderer.prepare_frame(frame)
-
+        frame = self.renderer.prepare_frame(self.model.at_frame(frame_index))
         self._cached_frame_index = frame_index
         self._cached_frame = frame
         return frame
 
+    def _overlay_request(
+        self,
+        *,
+        indices: tuple[int, ...],
+        source: SelectionMode | None,
+        highlight_enabled: bool,
+        box_outlines: bool,
+        box_outline_limit: int,
+        pixel_scale: float = 1.0,
+    ) -> GaussianOverlayRequest | None:
+        if not highlight_enabled or not indices:
+            return None
+
+        pixel_scale = max(1e-3, float(pixel_scale))
+        if source is SelectionMode.SINGLE and len(indices) == 1:
+            return GaussianOverlayRequest(
+                indices=indices,
+                draw_centers=True,
+                draw_ellipses=True,
+                max_ellipses=1,
+                center_radius_px=3.0 * pixel_scale,
+                ellipse_sigma=2.0,
+                line_width_px=max(1, int(round(2.0 * pixel_scale))),
+            )
+
+        return GaussianOverlayRequest(
+            indices=indices,
+            draw_centers=True,
+            draw_ellipses=box_outlines,
+            max_ellipses=(box_outline_limit if box_outlines else 0),
+            # Box selections can contain hundreds of Gaussians.  A fixed
+            # screen-space marker radius makes distant selections collapse
+            # into a solid blob, so size each center from gsplat's projected
+            # Gaussian radius instead.  These pixel clamps are scaled for the
+            # low-resolution interaction preview; after the browser stretches
+            # the preview back to canvas size, the apparent marker size stays
+            # consistent with the full-resolution render.
+            center_radius_px=1.0 * pixel_scale,
+            center_radius_from_projected=True,
+            center_radius_scale=0.15,
+            center_radius_min_px=0.35 * pixel_scale,
+            center_radius_max_px=1.25 * pixel_scale,
+            center_min_projected_radius_px=0.60 * pixel_scale,
+            ellipse_sigma=2.0,
+            line_width_px=max(1, int(round(1.0 * pixel_scale))),
+        )
+
     def _run(self) -> None:
         while True:
             with self._condition:
-                while not self._pending and not self._stopped:
-                    self._condition.wait()
-
-                if self._stopped:
+                if not self._wait_for_work_locked():
                     return
 
-                serial = self._serial
                 mode = self._mode
                 mode_epoch = self._mode_epoch
                 frame_index = self._frame_index
                 camera_snapshot = self._camera
+                camera_epoch = self._camera_epoch
+                selection_epoch = self._selection_epoch
+                selection_indices = self._selection_indices
+                selection_source = self._selection_source
+                selection_highlight_enabled = self._selection_highlight_enabled
+                box_outlines = self._box_outlines
+                box_outline_limit = self._box_outline_limit
+
+                now = time.monotonic()
+                preview = (
+                    mode is RenderMode.SPLAT
+                    and self._full_render_due
+                    and now - self._last_camera_update_wall
+                    < _CAMERA_SETTLE_SECONDS
+                )
                 self._pending = False
 
             try:
@@ -692,9 +1393,20 @@ class _DynamicRenderWorker:
                     if camera_snapshot is None:
                         continue
 
+                    max_width = self.max_width
+                    jpeg_quality = self.jpeg_quality
+                    radius_clip: float | None = None
+                    if preview:
+                        max_width = max(128, int(round(self.max_width * _PREVIEW_SCALE)))
+                        jpeg_quality = min(self.jpeg_quality, _PREVIEW_JPEG_QUALITY)
+                        radius_clip = max(
+                            self.renderer.radius_clip,
+                            _PREVIEW_RADIUS_CLIP,
+                        )
+
                     width, height = render_size(
                         camera_snapshot,
-                        max_width=self.max_width,
+                        max_width=max_width,
                         fallback_aspect=self.fallback_aspect,
                     )
                     camera = render_camera_from_viser(
@@ -704,22 +1416,49 @@ class _DynamicRenderWorker:
                         device=self.renderer.device,
                         dtype=frame.means.dtype,
                     )
-                    image = self.renderer.render(frame, camera)
+                    # The preview background is later stretched to the same
+                    # browser canvas size as a full-resolution render. Scale
+                    # pixel-sized overlay primitives down in the preview image
+                    # so their apparent on-screen size stays constant.
+                    overlay_pixel_scale = (
+                        _PREVIEW_SCALE if preview else 1.0
+                    )
+                    overlay = self._overlay_request(
+                        indices=selection_indices,
+                        source=selection_source,
+                        highlight_enabled=selection_highlight_enabled,
+                        box_outlines=box_outlines,
+                        box_outline_limit=box_outline_limit,
+                        pixel_scale=overlay_pixel_scale,
+                    )
+                    image = self.renderer.render(
+                        frame,
+                        camera,
+                        overlay=overlay,
+                        radius_clip=radius_clip,
+                    )
 
-                    # A newer frame/camera request may have arrived while this
-                    # image was rendering. Present this completed image anyway;
-                    # the next loop iteration will immediately render only the
-                    # latest pending state. This is what makes playback degrade
-                    # gracefully from e.g. 60 source FPS to 15 rendered FPS.
-                    if not self._can_present(mode, mode_epoch):
+                    # Camera/selection renders are never allowed to arrive late.
+                    # Timeline frame staleness is intentionally tolerated so
+                    # playback still degrades gracefully when render FPS is low.
+                    if not self._can_present_splat(
+                        mode_epoch=mode_epoch,
+                        camera_epoch=camera_epoch,
+                        selection_epoch=selection_epoch,
+                    ):
                         continue
 
                     self.client.scene.set_background_image(
                         image,
                         format="jpeg",
-                        jpeg_quality=self.jpeg_quality,
+                        jpeg_quality=jpeg_quality,
                     )
                     self.client.flush()
+
+                    if not preview:
+                        with self._condition:
+                            if self._camera_epoch == camera_epoch:
+                                self._full_render_due = False
 
                     render_fps = self._update_render_fps(
                         time.monotonic() - render_started
@@ -728,28 +1467,34 @@ class _DynamicRenderWorker:
                         mode,
                         frame_index,
                         render_fps,
+                        PresentedRenderState(
+                            frame_index=frame_index,
+                            camera=camera_snapshot,
+                            width=width,
+                            height=height,
+                            camera_epoch=camera_epoch,
+                            preview=preview,
+                        ),
                     )
                     continue
 
                 update = self.inspection.prepare_update(frame, mode)
-
-                if not self._can_present(mode, mode_epoch):
+                if not self._can_present_native(mode, mode_epoch):
                     continue
 
                 count = self.inspection.apply_update(update)
-
-                if not self._can_present(mode, mode_epoch):
+                if not self._can_present_native(mode, mode_epoch):
                     continue
 
                 render_fps = self._update_render_fps(
                     time.monotonic() - render_started
                 )
                 self.on_native_count(mode, count, frame_index)
-                self.on_present(
-                    mode,
-                    frame_index,
-                    render_fps,
-                )
+                self.on_present(mode, frame_index, render_fps, None)
 
             except Exception:
                 traceback.print_exc()
+
+
+def _format_quaternion(value: tuple[float, float, float, float]) -> str:
+    return "(" + ", ".join(f"{component:.6g}" for component in value) + ")"
