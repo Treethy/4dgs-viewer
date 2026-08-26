@@ -33,6 +33,14 @@ from viewer4d.visualization.selection import (
     pick_gaussian,
     select_gaussians_in_rect,
 )
+from viewer4d.visualization.trajectory import (
+    TrajectorySamplingMode,
+    TrajectorySamplingRange,
+    TrajectoryScene,
+    TrajectoryState,
+    build_anytimegs_trajectories,
+    sample_gaussians,
+)
 from viewer4d.visualization.viewer import (
     apply_initial_camera,
     initial_view,
@@ -56,6 +64,7 @@ _PREVIEW_JPEG_QUALITY = 70
 _PREVIEW_RADIUS_CLIP = 0.75
 _CAMERA_SETTLE_SECONDS = 0.12
 _BOX_DEPTH_MAX_WIDTH = 512
+_TRAJECTORY_DEFAULT_OPACITY_CUTOFF = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +242,16 @@ class _Client4DSession:
         self._selection_camera_lock: dict[str, Any] | None = None
         self._restoring_selection_camera = False
 
+        self.trajectory_state = TrajectoryState()
+        self.trajectory_scene = TrajectoryScene(
+            client,
+            base_point_size=base_point_size,
+        )
+        self._trajectory_random_generator = torch.Generator(device="cpu")
+        self._trajectory_random_generator.manual_seed(0)
+        self._trajectory_visible_count = 0
+        self._trajectory_update_error_reported = False
+
         inspection = InspectionScene(
             client,
             num_gaussians=model.num_gaussians,
@@ -272,6 +291,7 @@ class _Client4DSession:
         )
         self.worker.update_frame(0)
         self._refresh_selection(layout=True)
+        self._rebuild_trajectory_scene()
 
         self._play_thread = threading.Thread(
             target=self._play_loop,
@@ -329,24 +349,140 @@ class _Client4DSession:
             )
 
         with tab_group.add_tab("Trajectory"):
-            self.client.gui.add_markdown(
-                "Trajectory visualization will be added in the next phase."
-            )
+            with self.client.gui.add_folder(
+                "Sampling",
+                expand_by_default=True,
+            ):
+                self.trajectory_sampling_mode_dropdown = self.client.gui.add_dropdown(
+                    "Mode",
+                    options=tuple(mode.value for mode in TrajectorySamplingMode),
+                    initial_value=TrajectorySamplingMode.HIGH_SPEED.value,
+                )
+                self.trajectory_sampling_range_dropdown = self.client.gui.add_dropdown(
+                    "Range",
+                    options=tuple(value.value for value in TrajectorySamplingRange),
+                    initial_value=TrajectorySamplingRange.CURRENT_FRAME.value,
+                )
+                self.trajectory_sample_count_number = self.client.gui.add_number(
+                    "Count",
+                    initial_value=500,
+                    min=0,
+                    max=self.model.num_gaussians,
+                    step=1,
+                )
+                self.trajectory_opacity_cutoff_slider = self.client.gui.add_slider(
+                    "Min current opacity",
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    initial_value=_TRAJECTORY_DEFAULT_OPACITY_CUTOFF,
+                    hint=(
+                        "Current-frame sampling only: candidates must be inside their "
+                        "3σ lifespan and have at least this temporal opacity."
+                    ),
+                )
+                self.trajectory_sample_button = self.client.gui.add_button("Sample")
+                self.trajectory_sampled_count_number = self.client.gui.add_number(
+                    "Sampled Gaussians",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.trajectory_candidate_count_number = self.client.gui.add_number(
+                    "Candidate Gaussians",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.trajectory_sample_source_text = self.client.gui.add_text(
+                    "Sample source",
+                    "Not sampled",
+                    disabled=True,
+                )
+
+            with self.client.gui.add_folder(
+                "Tracking",
+                expand_by_default=True,
+            ):
+                self.trajectory_start_frame_number = self.client.gui.add_number(
+                    "Start tracking frame",
+                    initial_value=0,
+                    min=0,
+                    max=self.num_frames - 1,
+                    step=1,
+                    hint=(
+                        "Trajectories are not drawn before this frame. Each Gaussian "
+                        "is additionally clipped by its own 3σ lifespan."
+                    ),
+                )
+                self.trajectory_include_sampled_checkbox = self.client.gui.add_checkbox(
+                    "Include sampled Gaussians",
+                    initial_value=True,
+                )
+                self.trajectory_include_manual_checkbox = self.client.gui.add_checkbox(
+                    "Include manual Gaussians",
+                    initial_value=False,
+                )
+                self.trajectory_current_selection_count = self.client.gui.add_number(
+                    "Current Selection",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.trajectory_manual_add_action = self.client.gui.add_button_group(
+                    "Manual selection",
+                    options=("Add current selection",),
+                    hint=(
+                        "Add the current Selection-tab Gaussian IDs to the stored "
+                        "manual trajectory set."
+                    ),
+                )
+                self.trajectory_manual_clear_action = self.client.gui.add_button_group(
+                    "",
+                    options=("Clear manual selection",),
+                    hint="Clear all Gaussian IDs stored in the manual trajectory set.",
+                )
+                self.trajectory_manual_count_number = self.client.gui.add_number(
+                    "Manual Gaussians",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.trajectory_tracking_count_number = self.client.gui.add_number(
+                    "Tracking Gaussians",
+                    initial_value=0,
+                    disabled=True,
+                )
+                self.trajectory_visible_count_number = self.client.gui.add_number(
+                    "Visible Trajectories",
+                    initial_value=0,
+                    disabled=True,
+                )
+
+            with self.client.gui.add_folder(
+                "Display",
+                expand_by_default=True,
+            ):
+                self.trajectory_show_checkbox = self.client.gui.add_checkbox(
+                    "Show trajectories",
+                    initial_value=True,
+                )
+                self.trajectory_show_centers_checkbox = self.client.gui.add_checkbox(
+                    "Show current centers",
+                    initial_value=True,
+                )
+                self.trajectory_line_thickness_slider = self.client.gui.add_slider(
+                    "Line thickness (px)",
+                    min=0.5,
+                    max=5.0,
+                    step=0.5,
+                    initial_value=1.5,
+                )
 
         with tab_group.add_tab("Selection"):
-            self.client.gui.add_markdown("**Selection mode**")
-            self.selection_camera_button = self.client.gui.add_button(
-                "Camera",
-                color="dark",
-                hint="Normal camera navigation. This is the default mode.",
-            )
-            self.selection_single_button = self.client.gui.add_button(
-                "Single",
-                hint="Lock the current camera and click one Gaussian center.",
-            )
-            self.selection_box_button = self.client.gui.add_button(
-                "Box",
-                hint="Lock the current camera and drag a rectangle to select surface Gaussians.",
+            self.selection_mode_buttons = self.client.gui.add_button_group(
+                "Selection mode",
+                options=("Camera", "Single", "Box"),
+                hint=(
+                    "Camera: normal navigation. Single/Box: lock the current camera "
+                    "and use the mouse for Gaussian selection."
+                ),
             )
 
             self.selection_highlight_checkbox = self.client.gui.add_checkbox(
@@ -606,17 +742,87 @@ class _Client4DSession:
             if self.mode is RenderMode.ELLIPSOID:
                 self.worker.refresh()
 
-        @self.selection_camera_button.on_click
-        async def _selection_camera_click(_: Any) -> None:
-            self.set_selection_mode(SelectionMode.CAMERA)
+        @self.trajectory_sampling_range_dropdown.on_update
+        async def _trajectory_sampling_range_update(_: Any) -> None:
+            self._refresh_trajectory_sampling_controls()
 
-        @self.selection_single_button.on_click
-        async def _selection_single_click(_: Any) -> None:
-            self.set_selection_mode(SelectionMode.SINGLE)
+        @self.trajectory_sample_button.on_click
+        async def _trajectory_sample(_: Any) -> None:
+            self._sample_trajectory_gaussians()
 
-        @self.selection_box_button.on_click
-        async def _selection_box_click(_: Any) -> None:
-            self.set_selection_mode(SelectionMode.BOX)
+        @self.trajectory_start_frame_number.on_update
+        async def _trajectory_start_frame_update(_: Any) -> None:
+            frame = max(
+                0,
+                min(
+                    self.num_frames - 1,
+                    int(round(float(self.trajectory_start_frame_number.value))),
+                ),
+            )
+            self.trajectory_state.start_tracking_frame = frame
+            if self.trajectory_start_frame_number.value != frame:
+                self.trajectory_start_frame_number.value = frame
+            self._refresh_trajectory_scene()
+
+        @self.trajectory_include_sampled_checkbox.on_update
+        async def _trajectory_include_sampled_update(_: Any) -> None:
+            self.trajectory_state.include_sampled = bool(
+                self.trajectory_include_sampled_checkbox.value
+            )
+            self._rebuild_trajectory_scene()
+
+        @self.trajectory_include_manual_checkbox.on_update
+        async def _trajectory_include_manual_update(_: Any) -> None:
+            self.trajectory_state.include_manual = bool(
+                self.trajectory_include_manual_checkbox.value
+            )
+            self._rebuild_trajectory_scene()
+
+        @self.trajectory_manual_add_action.on_click
+        async def _trajectory_manual_add(_: Any) -> None:
+            self.trajectory_state.manual.update(
+                self.selection_state.selected.indices
+            )
+            if self.trajectory_state.manual:
+                self.trajectory_state.include_manual = True
+                self.trajectory_include_manual_checkbox.value = True
+            self._rebuild_trajectory_scene()
+
+        @self.trajectory_manual_clear_action.on_click
+        async def _trajectory_manual_clear(_: Any) -> None:
+            self.trajectory_state.manual.clear()
+            self._rebuild_trajectory_scene()
+
+        @self.trajectory_show_checkbox.on_update
+        async def _trajectory_show_update(_: Any) -> None:
+            self.trajectory_state.show_trajectories = bool(
+                self.trajectory_show_checkbox.value
+            )
+            self._refresh_trajectory_scene()
+
+        @self.trajectory_show_centers_checkbox.on_update
+        async def _trajectory_show_centers_update(_: Any) -> None:
+            self.trajectory_state.show_current_centers = bool(
+                self.trajectory_show_centers_checkbox.value
+            )
+            self._refresh_trajectory_scene()
+
+        @self.trajectory_line_thickness_slider.on_update
+        async def _trajectory_line_thickness_update(_: Any) -> None:
+            self.trajectory_scene.set_line_thickness(
+                float(self.trajectory_line_thickness_slider.value)
+            )
+
+        @self.selection_mode_buttons.on_click
+        async def _selection_mode_click(_: Any) -> None:
+            mode_by_label = {
+                "Camera": SelectionMode.CAMERA,
+                "Single": SelectionMode.SINGLE,
+                "Box": SelectionMode.BOX,
+            }
+            self.set_selection_mode(
+                mode_by_label[str(self.selection_mode_buttons.value)]
+            )
 
         @self.selection_highlight_checkbox.on_update
         async def _selection_highlight_update(_: Any) -> None:
@@ -641,10 +847,117 @@ class _Client4DSession:
             self.selection_state.clear()
             self.selection_highlight.clear()
             self._sync_selection_render_state()
-            self._refresh_selection_gui(layout=True)
+            self._refresh_selection(layout=True)
 
         self._refresh_selection_mode_buttons()
         self._refresh_selection_gui(layout=True)
+        self._refresh_trajectory_sampling_controls()
+        self._refresh_trajectory_gui()
+
+    def _refresh_trajectory_sampling_controls(self) -> None:
+        sampling_range = TrajectorySamplingRange(
+            self.trajectory_sampling_range_dropdown.value
+        )
+        self.trajectory_opacity_cutoff_slider.visible = (
+            sampling_range is TrajectorySamplingRange.CURRENT_FRAME
+        )
+
+    def _sample_trajectory_gaussians(self) -> None:
+        with self._state_lock:
+            frame_index = self._frame_index
+
+        sampling_mode = TrajectorySamplingMode(
+            self.trajectory_sampling_mode_dropdown.value
+        )
+        sampling_range = TrajectorySamplingRange(
+            self.trajectory_sampling_range_dropdown.value
+        )
+        count = max(0, int(round(float(self.trajectory_sample_count_number.value))))
+        if self.trajectory_sample_count_number.value != count:
+            self.trajectory_sample_count_number.value = count
+
+        result = sample_gaussians(
+            self.model,
+            mode=sampling_mode,
+            sampling_range=sampling_range,
+            count=count,
+            frame_index=(
+                frame_index
+                if sampling_range is TrajectorySamplingRange.CURRENT_FRAME
+                else None
+            ),
+            opacity_cutoff=float(self.trajectory_opacity_cutoff_slider.value),
+            random_generator=self._trajectory_random_generator,
+        )
+        self.trajectory_state.sampled.replace(result.indices)
+        self.trajectory_state.sampled_range = result.sampling_range
+        self.trajectory_state.sampled_at_frame = result.sampled_at_frame
+        self.trajectory_state.sampled_candidate_count = result.candidate_count
+        self._rebuild_trajectory_scene()
+
+    def _rebuild_trajectory_scene(self) -> None:
+        indices = self.trajectory_state.tracking_indices()
+        trajectories = build_anytimegs_trajectories(self.model, indices)
+        self.trajectory_scene.set_trajectories(trajectories)
+        self._refresh_trajectory_scene()
+
+    def _refresh_trajectory_scene(self) -> None:
+        with self._state_lock:
+            frame_index = self._frame_index
+
+        start_frame = max(
+            0,
+            min(self.num_frames - 1, self.trajectory_state.start_tracking_frame),
+        )
+        stats = self.trajectory_scene.update(
+            tracking_start_time=self.model.sequence.frame_to_time(start_frame),
+            current_time=self.model.sequence.frame_to_time(frame_index),
+            show_trajectories=self.trajectory_state.show_trajectories,
+            show_current_centers=self.trajectory_state.show_current_centers,
+        )
+        self._trajectory_visible_count = stats.visible_trajectories
+        self._refresh_trajectory_gui()
+
+    def _safe_refresh_trajectory_scene(self) -> None:
+        """Refresh trajectory geometry without ever killing timeline playback."""
+
+        try:
+            self._refresh_trajectory_scene()
+            self._trajectory_update_error_reported = False
+        except Exception:
+            # Trajectory visualization is auxiliary to the timeline. A bad scene
+            # update must not terminate the playback thread. Report the first
+            # failure and keep the underlying 4D render/timeline alive.
+            if not self._trajectory_update_error_reported:
+                print("[trajectory] scene update failed; playback will continue")
+                traceback.print_exc()
+                self._trajectory_update_error_reported = True
+
+    def _refresh_trajectory_gui(self) -> None:
+        self.trajectory_sampled_count_number.value = len(self.trajectory_state.sampled)
+        self.trajectory_candidate_count_number.value = int(
+            self.trajectory_state.sampled_candidate_count
+        )
+        if self.trajectory_state.sampled_range is None:
+            sample_source = "Not sampled"
+        elif self.trajectory_state.sampled_range is TrajectorySamplingRange.GLOBAL:
+            sample_source = "Global"
+        else:
+            frame = self.trajectory_state.sampled_at_frame
+            sample_source = f"Frame {frame}" if frame is not None else "Current frame"
+        if self.trajectory_sample_source_text.value != sample_source:
+            self.trajectory_sample_source_text.value = sample_source
+
+        self.trajectory_current_selection_count.value = len(
+            self.selection_state.selected
+        )
+        self.trajectory_manual_count_number.value = len(self.trajectory_state.manual)
+        self.trajectory_tracking_count_number.value = len(
+            self.trajectory_state.tracking_indices()
+        )
+        self.trajectory_visible_count_number.value = int(
+            self._trajectory_visible_count
+        )
 
     @property
     def mode(self) -> RenderMode:
@@ -695,16 +1008,91 @@ class _Client4DSession:
         self._refresh_selection_gui(layout=True)
 
     def _refresh_selection_mode_buttons(self) -> None:
-        mode = self.selection_state.mode
-        self.selection_camera_button.color = (
-            "dark" if mode is SelectionMode.CAMERA else None
-        )
-        self.selection_single_button.color = (
-            "dark" if mode is SelectionMode.SINGLE else None
-        )
-        self.selection_box_button.color = (
-            "dark" if mode is SelectionMode.BOX else None
-        )
+        label_by_mode = {
+            SelectionMode.CAMERA: "Camera",
+            SelectionMode.SINGLE: "Single",
+            SelectionMode.BOX: "Box",
+        }
+        desired = label_by_mode[self.selection_state.mode]
+        if str(self.selection_mode_buttons.value) != desired:
+            self.selection_mode_buttons.value = desired
+        self._apply_selection_mode_button_style(desired)
+
+    def _apply_selection_mode_button_style(self, active_label: str) -> None:
+        """Restore a persistent dark active state for Viser 1.0.30 button groups.
+
+        Viser 1.0.30 renders ``add_button_group()`` as a row of outline buttons
+        and does not visually distinguish the current value.  We keep the
+        compact horizontal layout, but explicitly style the active
+        Camera/Single/Box button after each mode change.
+        """
+        try:
+            from viser import _messages
+        except Exception:
+            return
+
+        active = str(active_label).replace("\\", "\\\\").replace('"', '\\"')
+        source = f"""
+(() => {{
+  const active = "{active}";
+  const expected = new Set(["Camera", "Single", "Box"]);
+
+  const apply = () => {{
+    const buttons = Array.from(document.querySelectorAll("button"));
+    let group = null;
+
+    for (const button of buttons) {{
+      const text = (button.textContent || "").trim();
+      if (!expected.has(text) || button.parentElement === null) continue;
+
+      const siblings = Array.from(button.parentElement.children).filter(
+        (node) => node instanceof HTMLButtonElement
+      );
+      const labels = siblings.map(
+        (node) => (node.textContent || "").trim()
+      );
+
+      if (
+        siblings.length === 3 &&
+        labels.every((label) => expected.has(label))
+      ) {{
+        group = siblings;
+        break;
+      }}
+    }}
+
+    if (group === null) return false;
+
+    for (const button of group) {{
+      const selected = (button.textContent || "").trim() === active;
+      if (selected) {{
+        button.style.setProperty("background-color", "#25262b", "important");
+        button.style.setProperty("border-color", "#25262b", "important");
+        button.style.setProperty("color", "#ffffff", "important");
+      }} else {{
+        button.style.removeProperty("background-color");
+        button.style.removeProperty("border-color");
+        button.style.removeProperty("color");
+      }}
+    }}
+    return true;
+  }};
+
+  // React may mount/update the GUI component just after the Python message.
+  // Re-apply a few times so the active style survives that render.
+  apply();
+  setTimeout(apply, 0);
+  setTimeout(apply, 40);
+  setTimeout(apply, 120);
+}})();
+"""
+        try:
+            self.client._websock_connection.queue_message(
+                _messages.RunJavascriptMessage(source=source)
+            )
+        except Exception:
+            # Styling is cosmetic; never let it affect viewer interaction.
+            pass
 
     def set_frame(self, frame_index: int, *, reanchor: bool) -> None:
         frame_index = max(0, min(self.num_frames - 1, int(frame_index)))
@@ -727,6 +1115,7 @@ class _Client4DSession:
         # Timeline playback updates values and native geometry only. It must not
         # touch GUI folder visibility; doing so makes the Timeline jump vertically.
         self._refresh_selection(layout=False)
+        self._safe_refresh_trajectory_scene()
 
     def set_playing(self, playing: bool) -> None:
         with self._play_condition:
@@ -753,6 +1142,7 @@ class _Client4DSession:
     def stop(self) -> None:
         self._remove_selection_pointer_callbacks()
         self.selection_highlight.clear()
+        self.trajectory_scene.clear()
 
         with self._play_condition:
             self._stopped = True
@@ -966,6 +1356,7 @@ class _Client4DSession:
             normalized_time=normalized_time,
             layout=layout,
         )
+        self._refresh_trajectory_gui()
 
     def _refresh_selection_gui(
         self,

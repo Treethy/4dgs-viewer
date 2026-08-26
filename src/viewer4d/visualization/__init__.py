@@ -7,12 +7,20 @@ from viewer4d.visualization.selection import (
     SelectionMode,
     SelectionState,
 )
+from viewer4d.visualization.trajectory import (
+    GaussianTrajectory,
+    TrajectorySamplingMode,
+    TrajectorySamplingRange,
+    TrajectoryScene,
+    TrajectoryState,
+)
 from viewer4d.visualization.viewer import GaussianViewer
 from viewer4d.visualization.viewer4d import Gaussian4DViewer
 
 __all__ = [
     "GaussianInspection",
     "GaussianSet",
+    "GaussianTrajectory",
     "GaussianViewer",
     "Gaussian4DViewer",
     "GsplatRenderer",
@@ -20,4 +28,8 @@ __all__ = [
     "SelectionHighlight",
     "SelectionMode",
     "SelectionState",
+    "TrajectorySamplingMode",
+    "TrajectorySamplingRange",
+    "TrajectoryScene",
+    "TrajectoryState",
 ]
