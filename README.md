@@ -2,7 +2,9 @@
 
 A simple interactive viewer for **FreeTimeGS++** checkpoints.
 
-This project is built for visualizing and inspecting dynamic 4D Gaussian Splatting results produced by [FreeTimeGS++](https://github.com/SNU-VGILab/FreeTimeGSPlusPlus).
+This project is built for visualizing and inspecting dynamic 4D Gaussian Splatting results from **FreeTimeGS++**:
+
+[FreeTimeGS++: Secrets of Dynamic Gaussian Splatting and Their Principles](https://arxiv.org/abs/2605.03337)
 
 The viewer uses `gsplat` for rendering and `viser` for browser-based interaction.
 
